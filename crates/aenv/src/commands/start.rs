@@ -1,3 +1,4 @@
+use crate::client::sandboxes::{SandboxAttachedDrive, SandboxAttachedDriveSource};
 use crate::client::{volumes::validate_volume_reference, Client};
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
@@ -36,6 +37,11 @@ pub struct Args {
     /// Mount a persistent volume using MOUNT_PATH=VOLUME_ID_OR_NAME (repeatable)
     #[arg(long = "volume", value_name = "MOUNT_PATH=VOLUME", action = clap::ArgAction::Append)]
     volumes: Vec<String>,
+    /// Attach a raw host file/block device as a drive, bypassing OverlayBD:
+    /// MOUNT_PATH=HOST_PATH[:ro|rw][:cache=Unsafe|Writeback] (repeatable).
+    /// For fast, disposable job disks provisioned by the caller.
+    #[arg(long = "drive", value_name = "MOUNT_PATH=HOST_PATH[:opts]", action = clap::ArgAction::Append)]
+    drives: Vec<String>,
 }
 
 fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
@@ -51,6 +57,7 @@ fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
     let volume_mounts = parse_volume_mounts(&args.volumes)?;
+    let attached_drives = parse_attached_drives(&args.drives)?;
     let sandbox = if args.cold {
         client.create_cold_sandbox(
             &args.target,
@@ -59,10 +66,11 @@ pub fn run(args: Args) -> Result<()> {
             args.resources.memory_mb,
             args.disk_size_mb,
             volume_mounts,
+            attached_drives,
         )?
     } else {
-        if args.resources.is_set() || args.disk_size_mb.is_some() {
-            anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
+        if args.resources.is_set() || args.disk_size_mb.is_some() || !args.drives.is_empty() {
+            anyhow::bail!("--cpu-count, --memory-mb, --disk-size-mb, and --drive require --cold");
         }
         client.create_sandbox(&args.target, Some(args.timeout), volume_mounts)?
     };
@@ -158,6 +166,72 @@ fn mount_paths_overlap(left: &str, right: &str) -> bool {
         || right
             .strip_prefix(left)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+/// Parse `--drive MOUNT_PATH=HOST_PATH[:ro|rw][:cache=Unsafe|Writeback]` into
+/// attached-drive requests. The host path is attached raw, bypassing OverlayBD.
+fn parse_attached_drives(values: &[String]) -> Result<Option<Vec<SandboxAttachedDrive>>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut drives = Vec::with_capacity(values.len());
+    let mut mount_paths: HashMap<String, ()> = HashMap::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        // Split off optional trailing :ro/:rw and :cache=... modifiers. The
+        // mount path and host path are the first two '='-separated fields;
+        // modifiers are ':'-separated after the host path.
+        let Some((mount_path, rest)) = value.split_once('=') else {
+            anyhow::bail!("drive must use MOUNT_PATH=HOST_PATH[:opts] syntax: {value}");
+        };
+        let mount_path = normalize_mount_path(mount_path)
+            .with_context(|| format!("invalid drive mount path in: {value}"))?;
+        if mount_paths.insert(mount_path.clone(), ()).is_some() {
+            anyhow::bail!("drive mount path is specified more than once: {mount_path}");
+        }
+
+        let mut read_only = false;
+        let mut cache_type: Option<String> = None;
+        let mut host_path = rest;
+        // Consume trailing ":ro"/":rw" and ":cache=..." modifiers.
+        loop {
+            if let Some((head, opt)) = host_path.rsplit_once(':') {
+                match opt {
+                    "ro" => {
+                        read_only = true;
+                        host_path = head;
+                        continue;
+                    }
+                    "rw" => {
+                        read_only = false;
+                        host_path = head;
+                        continue;
+                    }
+                    _ if opt.starts_with("cache=") => {
+                        cache_type = Some(opt["cache=".len()..].to_string());
+                        host_path = head;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            break;
+        }
+        if host_path.is_empty() || !host_path.starts_with('/') {
+            anyhow::bail!("drive host path must be an absolute path: {value}");
+        }
+
+        drives.push(SandboxAttachedDrive {
+            drive_id: format!("job{index}"),
+            read_only: Some(read_only),
+            mount_path: Some(mount_path),
+            cache_type,
+            source: SandboxAttachedDriveSource {
+                image: None,
+                host_path: Some(host_path.to_string()),
+            },
+        });
+    }
+    Ok(Some(drives))
 }
 
 async fn wait_for_envd(

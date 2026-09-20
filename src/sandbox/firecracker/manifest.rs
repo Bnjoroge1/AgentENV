@@ -141,7 +141,10 @@ impl FirecrackerSnapshotManifest {
                     mount_path: drive.mount_path().to_path_buf(),
                     sub_path: drive.sub_path().map(Path::to_path_buf),
                     virtual_size,
-                    image_config_path: drive.image_config_path().to_path_buf(),
+                    image_config_path: drive
+                        .image_config_path()
+                        .expect("only overlaybd drives are written to a snapshot manifest")
+                        .to_path_buf(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;

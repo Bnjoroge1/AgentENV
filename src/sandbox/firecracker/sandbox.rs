@@ -1190,7 +1190,17 @@ impl FirecrackerSandbox {
         let mut snapshot_common = self.launch.common().clone();
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
+        // Keep every configured drive (including Raw) in the persisted common
+        // config so resume re-prepares and reattaches them. Raw drives are
+        // still excluded from the manifest's portable attached-drive artifacts
+        // (manifest_extra_drives), but they count as physical drives — the
+        // manifest's physical_extra_drive_count must match this set, not the
+        // smaller overlaybd-only artifact list.
         snapshot_common.extra_drives = snapshot_extra_drives.clone();
+        snapshot_common.physical_extra_drive_count = snapshot_extra_drives
+            .iter()
+            .filter(|drive| !drive.is_volume())
+            .count();
         let mut rootfs_read_only = false;
 
         // Rewrite the overlaybd backend's image config path to point at the snapshot's rootfs.
@@ -1213,7 +1223,6 @@ impl FirecrackerSandbox {
             runtime_upper_mode,
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
-
         let mut manifest = FirecrackerSnapshotManifest::new(
             vm_state_path.clone(),
             mem_overlaybd_config.image_config_path.clone(),
@@ -1224,7 +1233,10 @@ impl FirecrackerSandbox {
         )
         .context("build firecracker snapshot manifest")?;
         manifest.volume_drive_slots = snapshot_common.volume_drive_slots;
-        manifest.physical_extra_drive_count = manifest_extra_drives.len();
+        // Physical drive count covers every non-volume drive (overlaybd + raw),
+        // matching snapshot_common.extra_drives — not just the portable
+        // manifest_extra_drives artifact list.
+        manifest.physical_extra_drive_count = snapshot_common.physical_extra_drive_count;
 
         let snapshot = FirecrackerSnapshotConfig {
             common: snapshot_common,
@@ -1479,7 +1491,7 @@ fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -
         common
             .extra_drives
             .iter()
-            .map(|drive| drive.image_config_path().to_path_buf()),
+            .filter_map(|drive| drive.image_config_path().map(Path::to_path_buf)),
     );
     paths
 }
@@ -2208,6 +2220,7 @@ impl FirecrackerSandbox {
                 false,
                 IoEngine::Sync,
                 None,
+                None,
             )
             .await
             .with_context(|| {
@@ -2229,6 +2242,7 @@ impl FirecrackerSandbox {
                 true,
                 IoEngine::Async,
                 build_disk_rate_limiter(&config.common.disk_rate_limit)?,
+                None,
             )
             .await?;
 
@@ -2272,16 +2286,8 @@ impl FirecrackerSandbox {
             self.fc_instance
                 .set_mmds_config("eth0")
                 .await
-                .context("Failed to set MMDS network configuration")?;
-            let mmds_metadata = self.mmds_metadata(&config.common);
-            self.fc_instance.set_mmds(&mmds_metadata).await?;
+                .context("Failed to set MMDS config")?;
         }
-
-        // ── Balloon: enable free page reporting ──
-        // Paired with DAMON reclaim (kernel boot args): DAMON reclaims cold
-        // pagecache pages inside the guest, and the balloon device reports the
-        // resulting free pages to the host VMM so it can release physical memory.
-        self.fc_instance.set_balloon().await?;
 
         Ok(())
     }
@@ -2294,9 +2300,10 @@ impl FirecrackerSandbox {
                     &drive.attachment_path,
                     false,
                     drive.read_only,
-                    true,
+                    drive.direct,
                     IoEngine::Async,
                     None,
+                    drive.cache_type,
                 )
                 .await
                 .with_context(|| format!("Failed to add extra drive {}", drive.drive_id))?;
@@ -2330,6 +2337,8 @@ impl FirecrackerSandbox {
                 drive_id,
                 attachment_path: PathBuf::from(attachment_name),
                 read_only: false,
+                cache_type: None,
+                direct: true,
             });
         }
         anyhow::ensure!(
@@ -2382,20 +2391,29 @@ impl FirecrackerSandbox {
     }
 
     async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
-        let extra_drives = &self.launch.common().extra_drives;
-        if extra_drives.is_empty() {
+        // Only OverlayBD drives are captured into a snapshot. Raw drives are
+        // node-local host paths — meaningless on another worker — so they are
+        // excluded from the committed manifest exactly like persistent volumes.
+        let overlaybd_drives: Vec<&ExtraDrive> = self
+            .launch
+            .common()
+            .extra_drives
+            .iter()
+            .filter(|drive| drive.image_config_path().is_some())
+            .collect();
+        if overlaybd_drives.is_empty() {
             return Ok(Vec::new());
         }
-        if extra_drives.len() != self.extra_drive_runtimes.len() {
+        if overlaybd_drives.len() != self.extra_drive_runtimes.len() {
             bail!(
-                "extra drive bookkeeping mismatch: {} configured drives but {} prepared devices",
-                extra_drives.len(),
+                "extra drive bookkeeping mismatch: {} overlaybd drives but {} prepared devices",
+                overlaybd_drives.len(),
                 self.extra_drive_runtimes.len()
             );
         }
 
-        let mut snapped = Vec::with_capacity(extra_drives.len());
-        for (drive, runtime) in extra_drives.iter().zip(self.extra_drive_runtimes.iter()) {
+        let mut snapped = Vec::with_capacity(overlaybd_drives.len());
+        for (drive, runtime) in overlaybd_drives.iter().zip(self.extra_drive_runtimes.iter()) {
             let persistent_output_dir = drive.snapshot_output_dir();
             let output_dir = persistent_output_dir.map_or_else(
                 || snapshot_dir.join("drives").join(drive.drive_id()),

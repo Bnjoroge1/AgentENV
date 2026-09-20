@@ -323,6 +323,7 @@ impl FirecrackerInstance {
         direct: bool,
         io_engine: IoEngine,
         rate_limiter: Option<Box<RateLimiter>>,
+        cache_type: Option<firecracker_client::models::drive::CacheType>,
     ) -> Result<()> {
         let mut drive = Drive::new(drive_id.to_string(), is_root_device);
         drive.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
@@ -330,6 +331,7 @@ impl FirecrackerInstance {
         drive.direct = Some(direct);
         drive.io_engine = Some(io_engine);
         drive.rate_limiter = rate_limiter;
+        drive.cache_type = cache_type;
         let path = format!("/drives/{}", drive_id);
         self.client
             .request_no_content(Method::PUT, &path, Some(&drive))

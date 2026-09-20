@@ -636,7 +636,6 @@ fn validate_overlaybd_extra_drive(
     mount_paths: &mut HashSet<PathBuf>,
 ) -> Result<()> {
     let drive_id = drive.drive_id();
-    let image_config_path = drive.image_config_path();
 
     validate_drive_id(drive_id)?;
     if !drive_ids.insert(drive_id.to_string()) {
@@ -656,11 +655,26 @@ fn validate_overlaybd_extra_drive(
     if matches!(drive.virtual_size(), Some(0)) {
         anyhow::bail!("extra drive virtual size must be non-zero: {}", drive_id);
     }
-    if !image_config_path.exists() {
-        anyhow::bail!(
-            "overlaybd image config not found at {}",
-            image_config_path.display()
-        );
+    match drive {
+        ExtraDrive::Overlaybd { .. } => {
+            let image_config_path = drive
+                .image_config_path()
+                .expect("overlaybd drive always has an image config");
+            if !image_config_path.exists() {
+                anyhow::bail!(
+                    "overlaybd image config not found at {}",
+                    image_config_path.display()
+                );
+            }
+        }
+        ExtraDrive::Raw { host_path, .. } => {
+            if !host_path.exists() {
+                anyhow::bail!(
+                    "raw drive host_path not found at {}",
+                    host_path.display()
+                );
+            }
+        }
     }
 
     Ok(())

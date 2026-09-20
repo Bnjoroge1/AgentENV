@@ -377,6 +377,13 @@ pub struct AttachedDrive {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_size_mb: Option<u32>,
 
+    /// Firecracker cache policy for a `hostPath` (raw) drive. Defaults to `Unsafe` (no host flush propagation) — correct for a disposable job disk. Use `Writeback` when the drive must survive a host crash. Ignored for `image` (OverlayBD) drives, which run under the daemon's own policy.
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "cacheType")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_type: Option<String>,
+
     #[serde(rename = "source")]
     #[validate(nested)]
     pub source: models::AttachedDriveSource,
@@ -391,6 +398,7 @@ impl AttachedDrive {
             mount_path: None,
             sub_path: None,
             disk_size_mb: None,
+            cache_type: None,
             source,
         }
     }
@@ -416,6 +424,9 @@ impl std::fmt::Display for AttachedDrive {
             self.disk_size_mb
                 .as_ref()
                 .map(|disk_size_mb| ["diskSizeMB".to_string(), disk_size_mb.to_string()].join(",")),
+            self.cache_type
+                .as_ref()
+                .map(|cache_type| ["cacheType".to_string(), cache_type.to_string()].join(",")),
             // Skipping source in query parameter serialization
         ];
 
@@ -443,6 +454,7 @@ impl std::str::FromStr for AttachedDrive {
             pub mount_path: Vec<String>,
             pub sub_path: Vec<String>,
             pub disk_size_mb: Vec<u32>,
+            pub cache_type: Vec<String>,
             pub source: Vec<models::AttachedDriveSource>,
         }
 
@@ -486,6 +498,10 @@ impl std::str::FromStr for AttachedDrive {
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
+                    "cacheType" => intermediate_rep.cache_type.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
                     "source" => intermediate_rep.source.push(
                         <models::AttachedDriveSource as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
@@ -513,6 +529,7 @@ impl std::str::FromStr for AttachedDrive {
             mount_path: intermediate_rep.mount_path.into_iter().next(),
             sub_path: intermediate_rep.sub_path.into_iter().next(),
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
+            cache_type: intermediate_rep.cache_type.into_iter().next(),
             source: intermediate_rep
                 .source
                 .into_iter()
@@ -564,20 +581,30 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<AttachedDriv
     }
 }
 
-/// Source for a sandbox attached drive. `image` must be provided.
+/// Source for a sandbox attached drive. Exactly one of `image` or `hostPath` must be provided.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct AttachedDriveSource {
     /// OCI image reference to resolve into an OverlayBD drive.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
-    pub image: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Absolute path to a file or block device on the host, attached directly to Firecracker bypassing OverlayBD/ublk. Node-local: the path is meaningful only on the worker running the sandbox and is excluded from snapshot manifests. Intended for fast, disposable job disks provisioned by the caller (e.g. a reflinked ext4 image).
+    #[serde(rename = "hostPath")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
 }
 
 impl AttachedDriveSource {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
-    pub fn new(image: String) -> AttachedDriveSource {
-        AttachedDriveSource { image }
+    pub fn new() -> AttachedDriveSource {
+        AttachedDriveSource {
+            image: None,
+            host_path: None,
+        }
     }
 }
 
@@ -586,8 +613,14 @@ impl AttachedDriveSource {
 /// Should be implemented in a serde serializer
 impl std::fmt::Display for AttachedDriveSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let params: Vec<Option<String>> =
-            vec![Some("image".to_string()), Some(self.image.to_string())];
+        let params: Vec<Option<String>> = vec![
+            self.image
+                .as_ref()
+                .map(|image| ["image".to_string(), image.to_string()].join(",")),
+            self.host_path
+                .as_ref()
+                .map(|host_path| ["hostPath".to_string(), host_path.to_string()].join(",")),
+        ];
 
         write!(
             f,
@@ -609,6 +642,7 @@ impl std::str::FromStr for AttachedDriveSource {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub image: Vec<String>,
+            pub host_path: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -634,6 +668,10 @@ impl std::str::FromStr for AttachedDriveSource {
                     "image" => intermediate_rep.image.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "hostPath" => intermediate_rep.host_path.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing AttachedDriveSource".to_string(),
@@ -648,11 +686,8 @@ impl std::str::FromStr for AttachedDriveSource {
 
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(AttachedDriveSource {
-            image: intermediate_rep
-                .image
-                .into_iter()
-                .next()
-                .ok_or_else(|| "image missing in AttachedDriveSource".to_string())?,
+            image: intermediate_rep.image.into_iter().next(),
+            host_path: intermediate_rep.host_path.into_iter().next(),
         })
     }
 }
@@ -3644,9 +3679,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 

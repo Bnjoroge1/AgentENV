@@ -44,6 +44,31 @@ pub enum ExtraDrive {
         #[serde(default)]
         volume: bool,
     },
+    /// A raw host file or block device attached directly to Firecracker,
+    /// bypassing OverlayBD/ublk entirely.
+    ///
+    /// Raw drives are node-local: `host_path` is meaningful only on the worker
+    /// that created it. They are excluded from committed snapshot manifests
+    /// (like volumes) because the backing path is not a portable artifact —
+    /// a restored sandbox re-attaches a fresh raw drive supplied by the caller.
+    Raw {
+        drive_id: String,
+        /// Absolute host path to the backing file or block device.
+        host_path: PathBuf,
+        read_only: bool,
+        #[serde(default)]
+        mount_path: PathBuf,
+        /// Optional sub-path inside the drive root to bind-mount onto
+        /// `mount_path`. Same semantics as the Overlaybd variant.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sub_path: Option<PathBuf>,
+        /// Firecracker cache policy for this drive. `None` uses the
+        /// Firecracker default (`Unsafe`, no host flush propagation) — the
+        /// right choice for a disposable job disk. Set `Writeback` when the
+        /// drive must survive a host crash.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_type: Option<firecracker_client::models::drive::CacheType>,
+    },
 }
 
 impl ExtraDrive {
@@ -62,6 +87,43 @@ impl ExtraDrive {
             None::<PathBuf>,
         )
     }
+    /// Build a raw host-path drive that bypasses OverlayBD/ublk.
+    ///
+    /// `host_path` must be absolute and point at an existing file or block
+    /// device; it is attached to Firecracker verbatim as `path_on_host`.
+    pub fn try_new_raw(
+        drive_id: impl Into<String>,
+        host_path: impl Into<PathBuf>,
+        read_only: bool,
+        mount_path: impl Into<PathBuf>,
+        sub_path: Option<impl Into<PathBuf>>,
+        cache_type: Option<firecracker_client::models::drive::CacheType>,
+    ) -> Result<Self> {
+        let drive_id = drive_id.into();
+        validate_drive_id(&drive_id)?;
+        let host_path = host_path.into();
+        anyhow::ensure!(
+            host_path.is_absolute(),
+            "raw drive '{drive_id}' host_path must be absolute: {}",
+            host_path.display()
+        );
+        anyhow::ensure!(
+            host_path.exists(),
+            "raw drive '{drive_id}' host_path does not exist: {}",
+            host_path.display()
+        );
+        let mount_path = normalize_mount_path_for_drive(&drive_id, mount_path.into())?;
+        let sub_path = sub_path.map(validate_sub_path).transpose()?;
+        Ok(Self::Raw {
+            drive_id,
+            host_path,
+            read_only,
+            mount_path,
+            sub_path,
+            cache_type,
+        })
+    }
+
 
     pub fn try_new_overlaybd_with_mount_path(
         drive_id: impl Into<String>,
@@ -92,39 +154,61 @@ impl ExtraDrive {
 
     pub fn drive_id(&self) -> &str {
         match self {
-            Self::Overlaybd { drive_id, .. } => drive_id,
+            Self::Overlaybd { drive_id, .. } | Self::Raw { drive_id, .. } => drive_id,
         }
     }
 
     pub fn read_only(&self) -> bool {
         match self {
-            Self::Overlaybd { read_only, .. } => *read_only,
+            Self::Overlaybd { read_only, .. } | Self::Raw { read_only, .. } => *read_only,
         }
     }
 
-    pub(crate) fn image_config_path(&self) -> &Path {
+    /// The OverlayBD image config backing this drive, if it is an OverlayBD
+    /// drive. Raw drives have no image config — their backing is `host_path`.
+    pub(crate) fn image_config_path(&self) -> Option<&Path> {
         match self {
             Self::Overlaybd {
                 image_config_path, ..
-            } => image_config_path,
+            } => Some(image_config_path),
+            Self::Raw { .. } => None,
+        }
+    }
+
+    /// The host backing path for a raw drive. `None` for OverlayBD drives,
+    /// whose backing is a materialized ublk device rather than a fixed path.
+    pub(crate) fn host_path(&self) -> Option<&Path> {
+        match self {
+            Self::Raw { host_path, .. } => Some(host_path),
+            Self::Overlaybd { .. } => None,
+        }
+    }
+
+    /// The requested Firecracker cache policy for a raw drive. `None` for
+    /// OverlayBD drives, which always run under the daemon's own policy.
+    pub(crate) fn cache_type(&self) -> Option<firecracker_client::models::drive::CacheType> {
+        match self {
+            Self::Raw { cache_type, .. } => *cache_type,
+            Self::Overlaybd { .. } => None,
         }
     }
 
     pub fn mount_path(&self) -> &Path {
         match self {
-            Self::Overlaybd { mount_path, .. } => mount_path,
+            Self::Overlaybd { mount_path, .. } | Self::Raw { mount_path, .. } => mount_path,
         }
     }
 
     pub fn sub_path(&self) -> Option<&Path> {
         match self {
-            Self::Overlaybd { sub_path, .. } => sub_path.as_deref(),
+            Self::Overlaybd { sub_path, .. } | Self::Raw { sub_path, .. } => sub_path.as_deref(),
         }
     }
 
     pub(crate) fn virtual_size(&self) -> Option<u64> {
         match self {
             Self::Overlaybd { virtual_size, .. } => *virtual_size,
+            Self::Raw { .. } => None,
         }
     }
 
@@ -142,12 +226,14 @@ impl ExtraDrive {
                 snapshot_output_dir,
                 ..
             } => snapshot_output_dir.as_deref(),
+            Self::Raw { .. } => None,
         }
     }
 
     pub(crate) fn is_volume(&self) -> bool {
         match self {
             Self::Overlaybd { volume, .. } => *volume,
+            Self::Raw { .. } => false,
         }
     }
 
@@ -171,6 +257,8 @@ impl ExtraDrive {
                 snapshot_output_dir: output_dir,
                 volume: true,
             },
+            // Raw drives are never persistent volumes; this is a no-op.
+            Self::Raw { .. } => self.clone(),
         }
     }
 
@@ -195,6 +283,8 @@ impl ExtraDrive {
                 snapshot_output_dir: snapshot_output_dir.clone(),
                 volume: *volume,
             },
+            // Raw drives have no image config to rewrite; this is a no-op.
+            Self::Raw { .. } => self.clone(),
         }
     }
 
@@ -223,6 +313,10 @@ impl ExtraDrive {
                 snapshot_output_dir: snapshot_output_dir.clone(),
                 volume: *volume,
             }),
+            // Raw drives carry no virtual size; setting one is meaningless.
+            Self::Raw { drive_id, .. } => anyhow::bail!(
+                "raw drive '{drive_id}' does not support a virtual size override"
+            ),
         }
     }
 }
@@ -259,11 +353,10 @@ pub fn validate_mount_path(path: &Path) -> Result<()> {
     }
     let raw = path
         .to_str()
-        .context("attached drive mountPath must be valid UTF-8")?;
-    if raw.chars().any(char::is_whitespace) || raw.contains(',') || raw.contains(':') {
+        .ok_or_else(|| anyhow::anyhow!("attached drive mountPath must be UTF-8"))?;
+    if raw.contains(' ') || raw.contains(',') || raw.contains(':') {
         anyhow::bail!(
-            "attached drive mountPath must not contain whitespace, commas, or colons: {}",
-            path.display()
+            "attached drive mountPath must not contain spaces, commas, or colons: {raw}"
         );
     }
     if path
@@ -358,6 +451,13 @@ pub(crate) struct DriveMount {
     pub(crate) drive_id: String,
     pub(crate) attachment_path: PathBuf,
     pub(crate) read_only: bool,
+    /// Firecracker cache policy for raw drives; `None` for OverlayBD drives,
+    /// which run under the daemon's own policy.
+    pub(crate) cache_type: Option<firecracker_client::models::drive::CacheType>,
+    /// Whether Firecracker opens the backing file with O_DIRECT. Raw drives use
+    /// buffered I/O (false) so the host page cache absorbs CI writes; OverlayBD
+    /// ublk devices use true.
+    pub(crate) direct: bool,
 }
 
 pub(crate) struct PreparedDrives {
@@ -441,13 +541,35 @@ pub(crate) async fn prepare_extra_drives(
     let mut runtimes = Vec::with_capacity(extra_drives.len());
 
     for drive in extra_drives {
+        // Raw drives bypass OverlayBD/ublk entirely: the host path is attached
+        // to Firecracker verbatim. They produce no runtime device and nothing
+        // to clean up — the backing file is owned by the caller, not us.
+        if let ExtraDrive::Raw {
+            host_path,
+            read_only,
+            cache_type,
+            ..
+        } = drive
+        {
+            mounts.push(DriveMount {
+                drive_id: drive.drive_id().to_string(),
+                attachment_path: host_path.clone(),
+                read_only: *read_only,
+                cache_type: *cache_type,
+                direct: false,
+            });
+            continue;
+        }
+
         let result = async {
             let runtime_dir = drive.runtime_dir(sandbox_work_dir);
             let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
             let allow_shrink = mode.allow_shrink();
             let runtime_device = UblkDeviceManager::global()
                 .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: drive.image_config_path(),
+                    source_image_config: drive
+                        .image_config_path()
+                        .expect("overlaybd drive always has an image config"),
                     global_config: global_config_path,
                     runtime_dir: &runtime_dir,
                     read_only: drive.read_only(),
@@ -503,6 +625,8 @@ pub(crate) async fn prepare_extra_drives(
                     drive_id: drive.drive_id().to_string(),
                     attachment_path: PathBuf::from(symlink_name),
                     read_only: drive.read_only(),
+                    cache_type: None,
+                    direct: true,
                 });
                 cleanup_paths.push(symlink_path);
                 runtimes.push(OverlaybdRuntimeHandle {

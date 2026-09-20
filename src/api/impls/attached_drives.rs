@@ -21,7 +21,18 @@ struct PendingAttachedDrive {
     mount_path: PathBuf,
     sub_path: Option<PathBuf>,
     virtual_size: Option<u64>,
-    image: String,
+    source: PendingSource,
+}
+
+/// A drive source that still needs resolution into an `ExtraDrive`.
+enum PendingSource {
+    /// OCI image ref → resolved into an OverlayBD image config by the resolver.
+    Image(String),
+    /// Absolute host path → attached raw, no resolution needed.
+    Raw {
+        host_path: PathBuf,
+        cache_type: Option<firecracker_client::models::drive::CacheType>,
+    },
 }
 
 /// Resolves attached drive declarations into `ResolvedAttachedDrive` values ready for sandbox launch.
@@ -71,16 +82,26 @@ pub(super) async fn resolve_attached_drives(
         // ublk daemon because prepare_extra_drives(Fresh) passes known=None.
         let virtual_size = virtual_size_from_disk_size_mb(drive.disk_size_mb)?;
 
-        let image = drive.source.image.trim().to_string();
-        if image.is_empty() {
-            return Err(models::Error::new(
-                400,
-                format!(
-                    "attached drive '{}' source requires exactly one image",
-                    drive_id
-                ),
-            ));
-        }
+        let image = drive.source.image.as_deref().unwrap_or("").trim();
+        let host_path = drive.source.host_path.as_deref().unwrap_or("").trim();
+        let source = match (image.is_empty(), host_path.is_empty()) {
+            (false, true) => PendingSource::Image(image.to_string()),
+            (true, false) => {
+                let cache_type = parse_cache_type(drive.cache_type.as_deref(), drive_id)?;
+                PendingSource::Raw {
+                    host_path: PathBuf::from(host_path),
+                    cache_type,
+                }
+            }
+            _ => {
+                return Err(models::Error::new(
+                    400,
+                    format!(
+                        "attached drive '{drive_id}' source requires exactly one of image or hostPath"
+                    ),
+                ));
+            }
+        };
 
         pending.push(PendingAttachedDrive {
             drive_id: drive_id.to_string(),
@@ -88,45 +109,73 @@ pub(super) async fn resolve_attached_drives(
             mount_path,
             sub_path,
             virtual_size,
-            image,
+            source,
         });
     }
 
+    // Resolve only the OCI-image drives; raw host-path drives need no
+    // resolution and are attached verbatim.
     let resolved_images = futures::future::try_join_all(pending.iter().map(|drive| async move {
-        image_resolver
-            .resolve(&drive.image)
-            .await
-            .map(|resolved| (resolved.overlaybd_config_path, resolved.raw_config))
-            .map_err(|err| {
-                models::Error::new(
-                    if err.is_user_error() { 400 } else { 500 },
-                    format!(
-                        "resolve attached drive '{}' image '{}': {err:#}",
-                        drive.drive_id, drive.image
-                    ),
-                )
-            })
+        match &drive.source {
+            PendingSource::Image(image) => image_resolver
+                .resolve(image)
+                .await
+                .map(|resolved| Some((resolved.overlaybd_config_path, resolved.raw_config)))
+                .map_err(|err| {
+                    models::Error::new(
+                        if err.is_user_error() { 400 } else { 500 },
+                        format!(
+                            "resolve attached drive '{}' image '{}': {err:#}",
+                            drive.drive_id, image
+                        ),
+                    )
+                }),
+            PendingSource::Raw { .. } => Ok(None),
+        }
     }))
     .await?;
 
     let mut resolved = Vec::with_capacity(pending.len());
-    for (drive, (image_config_path, raw_config)) in pending.into_iter().zip(resolved_images) {
-        let mut extra_drive = ExtraDrive::try_new_overlaybd_with_mount_path(
-            drive.drive_id,
-            image_config_path,
-            drive.read_only,
-            drive.mount_path,
-            drive.sub_path,
-        )
-        .map_err(bad_request)?;
-        if let Some(virtual_size) = drive.virtual_size {
-            extra_drive = extra_drive
-                .try_with_virtual_size(virtual_size)
+    for (drive, resolved_image) in pending.into_iter().zip(resolved_images) {
+        let extra_drive = match drive.source {
+            PendingSource::Raw {
+                host_path,
+                cache_type,
+            } => ExtraDrive::try_new_raw(
+                drive.drive_id,
+                host_path,
+                drive.read_only,
+                drive.mount_path,
+                drive.sub_path,
+                cache_type,
+            )
+            .map_err(bad_request)?,
+            PendingSource::Image(_) => {
+                let (image_config_path, raw_config) =
+                    resolved_image.expect("image drives always resolve");
+                let mut extra_drive = ExtraDrive::try_new_overlaybd_with_mount_path(
+                    drive.drive_id,
+                    image_config_path,
+                    drive.read_only,
+                    drive.mount_path,
+                    drive.sub_path,
+                )
                 .map_err(bad_request)?;
-        }
+                if let Some(virtual_size) = drive.virtual_size {
+                    extra_drive = extra_drive
+                        .try_with_virtual_size(virtual_size)
+                        .map_err(bad_request)?;
+                }
+                resolved.push(ResolvedAttachedDrive {
+                    drive: extra_drive,
+                    raw_config,
+                });
+                continue;
+            }
+        };
         resolved.push(ResolvedAttachedDrive {
             drive: extra_drive,
-            raw_config,
+            raw_config: None,
         });
     }
 
@@ -153,6 +202,25 @@ fn virtual_size_from_disk_size_mb(disk_size_mb: Option<u32>) -> Result<Option<u6
         .ok_or_else(|| {
             models::Error::new(400, "attached drive diskSizeMB overflows bytes".to_string())
         })
+}
+
+/// Parse an optional `cacheType` API value into a Firecracker cache policy.
+/// Defaults to `Unsafe` (Firecracker's own default) when unset — the right
+/// policy for a disposable job disk.
+fn parse_cache_type(
+    value: Option<&str>,
+    drive_id: &str,
+) -> Result<Option<firecracker_client::models::drive::CacheType>, models::Error> {
+    use firecracker_client::models::drive::CacheType;
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(v) if v.eq_ignore_ascii_case("unsafe") => Ok(Some(CacheType::Unsafe)),
+        Some(v) if v.eq_ignore_ascii_case("writeback") => Ok(Some(CacheType::Writeback)),
+        Some(v) => Err(models::Error::new(
+            400,
+            format!("attached drive '{drive_id}' cacheType must be Unsafe or Writeback, got '{v}'"),
+        )),
+    }
 }
 
 #[cfg(test)]

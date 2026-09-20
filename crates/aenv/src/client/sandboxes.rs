@@ -23,6 +23,26 @@ fn volume_mounts_request(
 }
 
 #[derive(Debug, Serialize)]
+pub struct SandboxAttachedDriveSource {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "hostPath")]
+    pub host_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SandboxAttachedDrive {
+    #[serde(rename = "driveID")]
+    pub drive_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readOnly")]
+    pub read_only: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "mountPath")]
+    pub mount_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cacheType")]
+    pub cache_type: Option<String>,
+    pub source: SandboxAttachedDriveSource,
+}
+#[derive(Debug, Serialize)]
 pub struct NewSandbox<'a> {
     #[serde(rename = "templateID")]
     pub template_id: &'a str,
@@ -47,6 +67,8 @@ pub struct NewColdSandbox<'a> {
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "attachedDrives")]
+    pub attached_drives: Option<Vec<SandboxAttachedDrive>>,
 }
 
 #[derive(Deserialize)]
@@ -119,6 +141,7 @@ impl Client {
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
         volume_mounts: Option<HashMap<String, String>>,
+        attached_drives: Option<Vec<SandboxAttachedDrive>>,
     ) -> Result<Sandbox> {
         let body = NewColdSandbox {
             image,
@@ -128,6 +151,7 @@ impl Client {
             disk_size_mb,
             secure: true,
             volume_mounts: volume_mounts_request(volume_mounts),
+            attached_drives,
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;

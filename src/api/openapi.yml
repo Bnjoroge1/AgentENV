@@ -254,13 +254,20 @@ components:
     AttachedDriveSource:
       type: object
       description: >
-        Source for a sandbox attached drive. `image` must be provided.
-      required:
-        - image
+        Source for a sandbox attached drive. Exactly one of `image` or
+        `hostPath` must be provided.
       properties:
         image:
           type: string
           description: OCI image reference to resolve into an OverlayBD drive.
+        hostPath:
+          type: string
+          description: >
+            Absolute path to a file or block device on the host, attached
+            directly to Firecracker bypassing OverlayBD/ublk. Node-local: the
+            path is meaningful only on the worker running the sandbox and is
+            excluded from snapshot manifests. Intended for fast, disposable
+            job disks provisioned by the caller (e.g. a reflinked ext4 image).
 
     AttachedDrive:
       type: object
@@ -297,6 +304,15 @@ components:
             colons, and must not start with `/`.
         diskSizeMB:
           $ref: "#/components/schemas/DiskSizeMB"
+        cacheType:
+          type: string
+          enum: [Unsafe, Writeback]
+          description: >
+            Firecracker cache policy for a `hostPath` (raw) drive. Defaults to
+            `Unsafe` (no host flush propagation) — correct for a disposable job
+            disk. Use `Writeback` when the drive must survive a host crash.
+            Ignored for `image` (OverlayBD) drives, which run under the daemon's
+            own policy.
         source:
           $ref: "#/components/schemas/AttachedDriveSource"
 
