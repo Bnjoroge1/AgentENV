@@ -67,7 +67,4 @@ if ! [[ "$result" =~ ^[0-9]+$ ]]; then
   echo "workload failed: $result" >&2
   exit 1
 fi
-
-echo "total_workload_ms=$result"
-echo "primary_metric=total_workload_ms"
-echo "direction=lower_is_better"
+echo "METRIC total_workload_ms=$result"
