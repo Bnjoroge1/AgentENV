@@ -172,6 +172,14 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
     let mod_rs = server_dir.join("src/apis/mod.rs");
     fix_duplicate_auth_trait(&mod_rs)?;
 
+    // rustfmt is not always at its own fixed point on the first pass over
+    // freshly generated code: expressions that land exactly at `max_width`
+    // can format differently depending on whether the input already has
+    // the expression split across lines. Run it twice so the committed
+    // output always matches what a second `cargo fmt` run (e.g. in CI)
+    // would produce, keeping `make check-codegen-server` from flaking on
+    // an unrelated formatting non-convergence.
+    util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");
     Ok(())

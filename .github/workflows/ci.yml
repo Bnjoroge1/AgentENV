@@ -14,6 +14,9 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "src/api/openapi.yml"
+      - "src/api/generated/**"
+      - "openapitools.json"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
   push:
@@ -28,6 +31,9 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "src/api/openapi.yml"
+      - "src/api/generated/**"
+      - "openapitools.json"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
 
@@ -62,3 +68,16 @@ jobs:
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
       - name: Unit tests
         run: make test-unit PROFILE=debug
+
+  codegen-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          install_ci_deps: "false"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Verify src/api/generated matches src/api/openapi.yml
+        run: make check-codegen-server

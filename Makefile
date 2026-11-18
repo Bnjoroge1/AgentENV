@@ -61,7 +61,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
-	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
+	firecracker-client envd-http-client agentenv-server check-codegen-server custom-extension-client start-server start-server-release \
 	services gateway scheduler \
 	deploy-build deploy-up deploy-up-no-build deploy-down deploy-logs deploy-ps \
 	k8s-build k8s-redeploy k8s-load-dev k8s-refresh-dev \
@@ -197,6 +197,16 @@ envd-http-client:
 
 agentenv-server:
 	$(CARGO) adev codegen server
+
+# Regenerates src/api/generated from src/api/openapi.yml and fails if the
+# result differs from what is committed. Used as the CI gate that keeps
+# src/api/openapi.yml the source of truth for the generated server; run
+# this locally after hand-editing the spec and before committing.
+check-codegen-server: agentenv-server
+	@git diff --exit-code -- src/api/generated || \
+		(echo "error: src/api/generated is out of date with src/api/openapi.yml." >&2; \
+		 echo "Run 'make agentenv-server' and commit the regenerated output." >&2; \
+		 exit 1)
 
 custom-extension-client:
 	$(CARGO) adev codegen custom-extension
